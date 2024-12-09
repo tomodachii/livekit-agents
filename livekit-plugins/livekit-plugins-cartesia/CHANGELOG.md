@@ -1,5 +1,54 @@
 # livekit-plugins-cartesia
 
+## 0.4.5
+
+### Patch Changes
+
+- fix release - [#1176](https://github.com/livekit/agents/pull/1176) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.4.4
+
+### Patch Changes
+
+- feat: tts retry & tts.FallbackAdapter - [#1074](https://github.com/livekit/agents/pull/1074) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.4.3
+
+### Patch Changes
+
+- add update_options to TTS - [#922](https://github.com/livekit/agents/pull/922) ([@theomonnom](https://github.com/theomonnom))
+
+- pipelineagent: expose timing metrics & api errors wip - [#957](https://github.com/livekit/agents/pull/957) ([@theomonnom](https://github.com/theomonnom))
+
+- expose usage metrics - [#984](https://github.com/livekit/agents/pull/984) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.4.2
+
+### Patch Changes
+
+- Add support for cartesia voice control - [#740](https://github.com/livekit/agents/pull/740) ([@bcherry](https://github.com/bcherry))
+
+## 0.4.1
+
+### Patch Changes
+
+- Switch Cartesia to a sentence tokenizer and keep the same context id throughout. - [#608](https://github.com/livekit/agents/pull/608) ([@keepingitneil](https://github.com/keepingitneil))
+  Propagate segment_id through the basic sentence tokenizer
+
+## 0.3.0
+
+### Minor Changes
+
+- cartesia: correctly add spaces & fix tests - [#591](https://github.com/livekit/agents/pull/591) ([@theomonnom](https://github.com/theomonnom))
+
+### Patch Changes
+
+- fix log warnings & cartesia end of speech - [#603](https://github.com/livekit/agents/pull/603) ([@theomonnom](https://github.com/theomonnom))
+
+- stt/tts: fix unread inputs when the input channel is closed - [#594](https://github.com/livekit/agents/pull/594) ([@theomonnom](https://github.com/theomonnom))
+
+- Adds websockets streaming to Cartesia plugin - [#544](https://github.com/livekit/agents/pull/544) ([@sauhardjain](https://github.com/sauhardjain))
+
 ## 0.2.0
 
 ### Minor Changes

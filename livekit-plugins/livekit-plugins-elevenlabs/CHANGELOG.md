@@ -1,5 +1,63 @@
 # livekit-plugins-elevenlabs
 
+## 0.7.9
+
+### Patch Changes
+
+- fix release - [#1176](https://github.com/livekit/agents/pull/1176) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.7.8
+
+### Patch Changes
+
+- feat: tts retry & tts.FallbackAdapter - [#1074](https://github.com/livekit/agents/pull/1074) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.7.7
+
+### Patch Changes
+
+- support language code in ElevenLabs TTS (#985) - [#1029](https://github.com/livekit/agents/pull/1029) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.7.6
+
+### Patch Changes
+
+- add update_options to TTS - [#922](https://github.com/livekit/agents/pull/922) ([@theomonnom](https://github.com/theomonnom))
+
+- pipelineagent: expose timing metrics & api errors wip - [#957](https://github.com/livekit/agents/pull/957) ([@theomonnom](https://github.com/theomonnom))
+
+- expose usage metrics - [#984](https://github.com/livekit/agents/pull/984) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.7.5
+
+### Patch Changes
+
+- avoid returning tiny frames from TTS - [#747](https://github.com/livekit/agents/pull/747) ([@theomonnom](https://github.com/theomonnom))
+
+- 11labs: send phoneme in one entire xml chunk - [#766](https://github.com/livekit/agents/pull/766) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.7.4
+
+### Patch Changes
+
+- elevenlabs: expose enable_ssml_parsing - [#723](https://github.com/livekit/agents/pull/723) ([@theomonnom](https://github.com/theomonnom))
+
+## 0.7.3
+
+### Patch Changes
+
+- elevenlabs: fix send_task not closing properly - [#596](https://github.com/livekit/agents/pull/596) ([@theomonnom](https://github.com/theomonnom))
+
+- Fix elevenlabs voice settings breaking - [#586](https://github.com/livekit/agents/pull/586) ([@nbsp](https://github.com/nbsp))
+
+## 0.7.2
+
+### Patch Changes
+
+- elevenlabs: update default model to eleven_turbo_v2_5 - [#578](https://github.com/livekit/agents/pull/578) ([@theomonnom](https://github.com/theomonnom))
+
+- gracefully error on non-PCM data - [#567](https://github.com/livekit/agents/pull/567) ([@nbsp](https://github.com/nbsp))
+
 ## 0.7.1
 
 ### Patch Changes

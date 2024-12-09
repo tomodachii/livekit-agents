@@ -4,100 +4,76 @@ import asyncio
 import contextlib
 import logging
 import multiprocessing as mp
+import socket
 import sys
 import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from multiprocessing.context import BaseContext
-from typing import Any, Callable, Coroutine
+from typing import Any
 
-from .. import utils
-from ..job import JobContext, JobProcess, RunningJobInfo
+import psutil
+
 from ..log import logger
-from . import channel, proc_main, proto
+from ..utils import aio, log_exceptions, time_ms
+from ..utils.aio import duplex_unix
+from . import channel, proto
+from .log_queue import LogQueueListener
 
 
-class LogQueueListener:
-    _sentinel = None
-
-    def __init__(
-        self, queue: mp.Queue, prepare_fnc: Callable[[logging.LogRecord], None]
-    ):
-        self._thread: threading.Thread | None = None
-        self._q = queue
-        self._prepare_fnc = prepare_fnc
-
-    def start(self) -> None:
-        self._thread = t = threading.Thread(
-            target=self._monitor, daemon=True, name="log_listener"
-        )
-        t.start()
-
-    def stop(self) -> None:
-        if self._thread is None:
-            return
-        self._q.put_nowait(self._sentinel)
-        self._thread.join()
-        self._thread = None
-
-    def handle(self, record: logging.LogRecord) -> None:
-        self._prepare_fnc(record)
-
-        lger = logging.getLogger(record.name)
-        if not lger.isEnabledFor(record.levelno):
-            return
-
-        lger.callHandlers(record)
-
-    def _monitor(self):
-        while True:
-            record = self._q.get()
-            if record is self._sentinel:
-                break
-
-            self.handle(record)
+@dataclass
+class _ProcOpts:
+    initialize_timeout: float
+    close_timeout: float
+    memory_warn_mb: float
+    memory_limit_mb: float
+    ping_interval: float
+    ping_timeout: float
+    high_ping_threshold: float
 
 
-class SupervisedProc:
+class SupervisedProc(ABC):
     def __init__(
         self,
         *,
-        initialize_process_fnc: Callable[[JobProcess], Any],
-        job_entrypoint_fnc: Callable[[JobContext], Coroutine],
         initialize_timeout: float,
         close_timeout: float,
+        memory_warn_mb: float,
+        memory_limit_mb: float,
+        ping_interval: float,
+        ping_timeout: float,
+        high_ping_threshold: float,
         mp_ctx: BaseContext,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
         self._loop = loop
-        log_q = mp_ctx.Queue()
-        log_q.cancel_join_thread()
-        mp_pch, mp_cch = mp_ctx.Pipe(duplex=True)
-
-        self._pch = channel.AsyncProcChannel(
-            conn=mp_pch, loop=self._loop, messages=proto.IPC_MESSAGES
+        self._mp_ctx = mp_ctx
+        self._opts = _ProcOpts(
+            initialize_timeout=initialize_timeout,
+            close_timeout=close_timeout,
+            memory_warn_mb=memory_warn_mb,
+            memory_limit_mb=memory_limit_mb,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
+            high_ping_threshold=high_ping_threshold,
         )
-
-        self._initialize_timeout = initialize_timeout
-        self._close_timeout = close_timeout
-        self._proc_args = proto.ProcStartArgs(
-            initialize_process_fnc=initialize_process_fnc,
-            job_entrypoint_fnc=job_entrypoint_fnc,
-            log_q=log_q,
-            mp_cch=mp_cch,
-            asyncio_debug=loop.get_debug(),
-        )
-
-        self._proc = mp_ctx.Process(  # type: ignore
-            target=proc_main.main, args=(self._proc_args,), name="job_proc"
-        )
-        self._running_job: RunningJobInfo | None = None
 
         self._exitcode: int | None = None
-        self._pid: int | None = self._proc.pid
+        self._pid: int | None = None
 
-        self._main_atask: asyncio.Task[None] | None = None
+        self._supervise_atask: asyncio.Task[None] | None = None
         self._closing = False
         self._kill_sent = False
         self._initialize_fut = asyncio.Future[None]()
+        self._lock = asyncio.Lock()
+
+    @abstractmethod
+    def _create_process(
+        self, cch: socket.socket, log_cch: socket.socket
+    ) -> mp.Process: ...
+
+    @abstractmethod
+    async def _main_task(self, ipc_ch: aio.ChanReceiver[channel.Message]) -> None: ...
 
     @property
     def exitcode(self) -> int | None:
@@ -113,66 +89,81 @@ class SupervisedProc:
 
     @property
     def started(self) -> bool:
-        return self._main_atask is not None
+        return self._supervise_atask is not None
 
-    @property
-    def start_arguments(self) -> Any | None:
-        return self._proc_args.user_arguments
-
-    @start_arguments.setter
-    def start_arguments(self, value: Any | None) -> None:
-        self._proc_args.user_arguments = value
-
-    @property
-    def running_job(self) -> RunningJobInfo | None:
-        return self._running_job
-
-    def start(self) -> None:
-        """start the job process"""
+    async def start(self) -> None:
+        """start the supervised process"""
         if self.started:
             raise RuntimeError("process already started")
 
         if self._closing:
             raise RuntimeError("process is closed")
 
+        await asyncio.shield(self._start())
+
+    async def _start(self) -> None:
         def _add_proc_ctx_log(record: logging.LogRecord) -> None:
             extra = self.logging_extra()
             for key, value in extra.items():
                 setattr(record, key, value)
 
-        log_listener = LogQueueListener(self._proc_args.log_q, _add_proc_ctx_log)
-        log_listener.start()
+        async with self._lock:
+            mp_pch, mp_cch = socket.socketpair()
+            mp_log_pch, mp_log_cch = socket.socketpair()
 
-        self._proc.start()
-        self._pid = self._proc.pid
-        self._join_fut = asyncio.Future[None]()
+            self._pch = await duplex_unix._AsyncDuplex.open(mp_pch)
 
-        def _sync_run():
-            self._proc.join()
-            log_listener.stop()
-            self._loop.call_soon_threadsafe(self._join_fut.set_result, None)
+            log_pch = duplex_unix._Duplex.open(mp_log_pch)
+            log_listener = LogQueueListener(log_pch, _add_proc_ctx_log)
+            log_listener.start()
 
-        thread = threading.Thread(target=_sync_run)
-        thread.start()
-        self._main_atask = asyncio.create_task(self._main_task())
+            self._proc = self._create_process(mp_cch, mp_log_cch)
+            self._proc.start()
+            mp_log_cch.close()
+            mp_cch.close()
+
+            self._pid = self._proc.pid
+            self._join_fut = asyncio.Future[None]()
+
+            def _sync_run():
+                self._proc.join()
+                log_listener.stop()
+                try:
+                    self._loop.call_soon_threadsafe(self._join_fut.set_result, None)
+                except RuntimeError:
+                    pass
+
+            thread = threading.Thread(target=_sync_run, name="proc_join_thread")
+            thread.start()
+            self._supervise_atask = asyncio.create_task(self._supervise_task())
 
     async def join(self) -> None:
-        """wait for the job process to finish"""
+        """wait for the process to finish"""
         if not self.started:
             raise RuntimeError("process not started")
 
-        if self._main_atask:
-            await asyncio.shield(self._main_atask)
+        async with self._lock:
+            if self._supervise_atask:
+                await asyncio.shield(self._supervise_atask)
 
     async def initialize(self) -> None:
-        """initialize the job process, this is calling the user provided initialize_process_fnc
-        raise asyncio.TimeoutError if initialization times out"""
-        await self._pch.asend(proto.InitializeRequest())
+        """initialize the process, this is sending a InitializeRequest message and waiting for a
+        InitializeResponse with a timeout"""
+        await channel.asend_message(
+            self._pch,
+            proto.InitializeRequest(
+                asyncio_debug=self._loop.get_debug(),
+                ping_interval=self._opts.ping_interval,
+                ping_timeout=self._opts.ping_timeout,
+                high_ping_threshold=self._opts.high_ping_threshold,
+            ),
+        )
 
         # wait for the process to become ready
         try:
             init_res = await asyncio.wait_for(
-                self._pch.arecv(), timeout=self._initialize_timeout
+                channel.arecv_message(self._pch, proto.IPC_MESSAGES),
+                timeout=self._opts.initialize_timeout,
             )
             assert isinstance(
                 init_res, proto.InitializeResponse
@@ -182,65 +173,63 @@ class SupervisedProc:
                 asyncio.TimeoutError("process initialization timed out")
             )
             logger.error(
-                "initialization timed out, killing job", extra=self.logging_extra()
+                "initialization timed out, killing process", extra=self.logging_extra()
             )
             self._send_kill_signal()
+            raise
+        except Exception as e:  # should be channel.ChannelClosed most of the time
+            self._initialize_fut.set_exception(e)
             raise
         else:
             self._initialize_fut.set_result(None)
 
     async def aclose(self) -> None:
-        """attempt to gracefully close the job process"""
+        """attempt to gracefully close the supervised process"""
         if not self.started:
-            raise RuntimeError("process not started")
+            return
 
         self._closing = True
-        with contextlib.suppress(channel.ChannelClosed):
-            await self._pch.asend(proto.ShutdownRequest())
+        with contextlib.suppress(duplex_unix.DuplexClosed):
+            await channel.asend_message(self._pch, proto.ShutdownRequest())
 
         try:
-            if self._main_atask:
+            if self._supervise_atask:
                 await asyncio.wait_for(
-                    asyncio.shield(self._main_atask), timeout=self._close_timeout
+                    asyncio.shield(self._supervise_atask),
+                    timeout=self._opts.close_timeout,
                 )
         except asyncio.TimeoutError:
             logger.error(
-                "process did not exit in time, killing job", extra=self.logging_extra()
+                "process did not exit in time, killing process",
+                extra=self.logging_extra(),
             )
             self._send_kill_signal()
 
-        if self._main_atask:
-            await asyncio.shield(self._main_atask)
+        async with self._lock:
+            if self._supervise_atask:
+                await asyncio.shield(self._supervise_atask)
 
     async def kill(self) -> None:
-        """forcefully kill the job process"""
+        """forcefully kill the supervised process"""
         if not self.started:
             raise RuntimeError("process not started")
 
         self._closing = True
         self._send_kill_signal()
-        if self._main_atask:
-            await asyncio.shield(self._main_atask)
 
-    async def launch_job(self, info: RunningJobInfo) -> None:
-        """start/assign a job to the process"""
-        if self._running_job is not None:
-            raise RuntimeError("process already has a running job")
-
-        self._running_job = info
-        start_req = proto.StartJobRequest()
-        start_req.running_job = info
-        await self._pch.asend(start_req)
+        async with self._lock:
+            if self._supervise_atask:
+                await asyncio.shield(self._supervise_atask)
 
     def _send_kill_signal(self) -> None:
-        """forcefully kill the job process"""
+        """forcefully kill the process"""
         try:
             if not self._proc.is_alive():
                 return
         except ValueError:
             return
 
-        logger.debug("killing job process", extra=self.logging_extra())
+        logger.info("killing process", extra=self.logging_extra())
         if sys.platform == "win32":
             self._proc.terminate()
         else:
@@ -248,77 +237,166 @@ class SupervisedProc:
 
         self._kill_sent = True
 
-    @utils.log_exceptions(logger=logger)
-    async def _main_task(self) -> None:
+    @log_exceptions(logger=logger)
+    async def _supervise_task(self) -> None:
         try:
             await self._initialize_fut
         except asyncio.TimeoutError:
-            # this happens when the initialization takes longer than self._initialize_timeout
-            pass
+            pass  # this happens when the initialization takes longer than self._initialize_timeout
+        except Exception:
+            pass  # initialization failed
 
-        # the process is killed if it doesn't respond to pings within this time
-        pong_timeout = utils.aio.sleep(proto.PING_TIMEOUT)
+        # the process is killed if it doesn't respond to ping requests
+        pong_timeout = aio.sleep(self._opts.ping_timeout)
+
+        ipc_ch = aio.Chan[channel.Message]()
+
+        main_task = asyncio.create_task(self._main_task(ipc_ch))
+        read_ipc_task = asyncio.create_task(self._read_ipc_task(ipc_ch, pong_timeout))
         ping_task = asyncio.create_task(self._ping_pong_task(pong_timeout))
-        monitor_task = asyncio.create_task(self._monitor_task(pong_timeout))
+        read_ipc_task.add_done_callback(lambda _: ipc_ch.close())
+
+        memory_monitor_task: asyncio.Task[None] | None = None
+        if self._opts.memory_limit_mb > 0 or self._opts.memory_warn_mb > 0:
+            memory_monitor_task = asyncio.create_task(self._memory_monitor_task())
 
         await self._join_fut
         self._exitcode = self._proc.exitcode
         self._proc.close()
-        await utils.aio.gracefully_cancel(ping_task, monitor_task)
+        await aio.gracefully_cancel(ping_task, read_ipc_task, main_task)
 
-        await self._pch.aclose()
+        if memory_monitor_task is not None:
+            await aio.gracefully_cancel(memory_monitor_task)
+
+        with contextlib.suppress(duplex_unix.DuplexClosed):
+            await self._pch.aclose()
 
         if self._exitcode != 0 and not self._kill_sent:
             logger.error(
-                f"job process exited with non-zero exit code {self.exitcode}",
+                f"process exited with non-zero exit code {self.exitcode}",
                 extra=self.logging_extra(),
             )
 
-    @utils.log_exceptions(logger=logger)
-    async def _monitor_task(self, pong_timeout: utils.aio.Sleep) -> None:
+    @log_exceptions(logger=logger)
+    async def _read_ipc_task(
+        self, ipc_ch: aio.Chan[channel.Message], pong_timeout: aio.Sleep
+    ) -> None:
         while True:
-            msg = await self._pch.arecv()
+            try:
+                msg = await channel.arecv_message(self._pch, proto.IPC_MESSAGES)
+            except duplex_unix.DuplexClosed:
+                break
 
             if isinstance(msg, proto.PongResponse):
-                delay = utils.time_ms() - msg.timestamp
-                if delay > proto.HIGH_PING_THRESHOLD * 1000:
+                delay = time_ms() - msg.timestamp
+                if delay > self._opts.high_ping_threshold * 1000:
                     logger.warning(
-                        "job process is unresponsive",
+                        "process is unresponsive",
                         extra={"delay": delay, **self.logging_extra()},
                     )
 
-                with contextlib.suppress(utils.aio.SleepFinished):
+                with contextlib.suppress(aio.SleepFinished):
                     pong_timeout.reset()
 
             if isinstance(msg, proto.Exiting):
-                logger.debug(
-                    "job exiting", extra={"reason": msg.reason, **self.logging_extra()}
+                logger.info(
+                    "process exiting",
+                    extra={"reason": msg.reason, **self.logging_extra()},
                 )
 
-    @utils.log_exceptions(logger=logger)
-    async def _ping_pong_task(self, pong_timeout: utils.aio.Sleep) -> None:
-        ping_interval = utils.aio.interval(proto.PING_INTERVAL)
+            ipc_ch.send_nowait(msg)
+
+    @log_exceptions(logger=logger)
+    async def _ping_pong_task(self, pong_timeout: aio.Sleep) -> None:
+        ping_interval = aio.interval(self._opts.ping_interval)
 
         async def _send_ping_co():
             while True:
                 await ping_interval.tick()
                 try:
-                    await self._pch.asend(proto.PingRequest(timestamp=utils.time_ms()))
-                except channel.ChannelClosed:
+                    await channel.asend_message(
+                        self._pch, proto.PingRequest(timestamp=time_ms())
+                    )
+                except duplex_unix.DuplexClosed:
                     break
 
         async def _pong_timeout_co():
             await pong_timeout
-            logger.error("job is unresponsive, killing job", extra=self.logging_extra())
+            logger.error(
+                "process is unresponsive, killing process", extra=self.logging_extra()
+            )
             self._send_kill_signal()
 
-        await asyncio.gather(_send_ping_co(), _pong_timeout_co())
+        tasks = [
+            asyncio.create_task(_send_ping_co()),
+            asyncio.create_task(_pong_timeout_co()),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await aio.gracefully_cancel(*tasks)
 
-    def logging_extra(self) -> dict:
-        extra: dict = {
+    @log_exceptions(logger=logger)
+    async def _memory_monitor_task(self) -> None:
+        """Monitor memory usage and kill the process if it exceeds the limit."""
+        while not self._closing and not self._kill_sent:
+            try:
+                if not self._pid:
+                    await asyncio.sleep(5)
+                    continue
+
+                # get process memory info
+                process = psutil.Process(self._pid)
+                memory_info = process.memory_info()
+                memory_mb = memory_info.rss / (1024 * 1024)  # Convert to MB
+
+                if (
+                    self._opts.memory_limit_mb > 0
+                    and memory_mb > self._opts.memory_limit_mb
+                ):
+                    logger.error(
+                        "process exceeded memory limit, killing process",
+                        extra={
+                            "memory_usage_mb": memory_mb,
+                            "memory_limit_mb": self._opts.memory_limit_mb,
+                            **self.logging_extra(),
+                        },
+                    )
+                    self._send_kill_signal()
+                elif (
+                    self._opts.memory_warn_mb > 0
+                    and memory_mb > self._opts.memory_warn_mb
+                ):
+                    logger.warning(
+                        "process memory usage is high",
+                        extra={
+                            "memory_usage_mb": memory_mb,
+                            "memory_warn_mb": self._opts.memory_warn_mb,
+                            "memory_limit_mb": self._opts.memory_limit_mb,
+                            **self.logging_extra(),
+                        },
+                    )
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                logger.warning(
+                    "Failed to get memory info for process",
+                    extra=self.logging_extra(),
+                    exc_info=e,
+                )
+            except Exception:
+                if self._closing or self._kill_sent:
+                    return
+
+                logger.exception(
+                    "Error in memory monitoring task",
+                    extra=self.logging_extra(),
+                )
+
+            await asyncio.sleep(5)  # check every 5 seconds
+
+    def logging_extra(self):
+        extra: dict[str, Any] = {
             "pid": self.pid,
         }
-        if self._running_job:
-            extra["job_id"] = self._running_job.job.id
 
         return extra

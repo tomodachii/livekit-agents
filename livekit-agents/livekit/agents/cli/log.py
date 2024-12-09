@@ -9,7 +9,24 @@ from datetime import date, datetime, time, timezone
 from inspect import istraceback
 from typing import Any, Dict, Tuple
 
-from ..log import logger
+from ..plugin import Plugin
+
+# noisy loggers are set to warn by default
+NOISY_LOGGERS = [
+    "httpx",
+    "httpcore",
+    "openai",
+    "watchfiles",
+    "anthropic",
+]
+
+
+def _silence_noisy_loggers() -> None:
+    for noisy_logger in NOISY_LOGGERS:
+        logger = logging.getLogger(noisy_logger)
+        if logger.level == logging.NOTSET:
+            logger.setLevel(logging.WARN)
+
 
 # skip default LogRecord attributes
 # http://docs.python.org/library/logging.html#logrecord-attributes
@@ -91,6 +108,8 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Formats a log record and serializes to json"""
         message_dict: Dict[str, Any] = {}
+        message_dict["level"] = record.levelname
+        message_dict["name"] = record.name
 
         if isinstance(record.msg, dict):
             message_dict = record.msg
@@ -105,7 +124,6 @@ class JsonFormatter(logging.Formatter):
             message_dict["exc_info"] = self.formatException(record.exc_info)
         if not message_dict.get("exc_info") and record.exc_text:
             message_dict["exc_info"] = record.exc_text
-
         if record.stack_info and not message_dict.get("stack_info"):
             message_dict["stack_info"] = self.formatStack(record.stack_info)
 
@@ -135,6 +153,7 @@ class ColoredFormatter(logging.Formatter):
             "esc_blue": self._esc(34),
             "esc_purple": self._esc(35),
             "esc_cyan": self._esc(36),
+            "esc_gray": self._esc(90),
             "esc_bold_red": self._esc(1, 31),
         }
 
@@ -180,13 +199,13 @@ class ColoredFormatter(logging.Formatter):
         return msg + self._esc_codes["esc_reset"]
 
 
-def setup_logging(log_level: str, production: bool = True) -> None:
+def setup_logging(log_level: str, devmode: bool) -> None:
     handler = logging.StreamHandler()
 
-    if not production:
+    if devmode:
         # colorful logs for dev (improves readability)
         colored_formatter = ColoredFormatter(
-            "%(asctime)s - %(esc_levelcolor)s%(levelname)-4s%(esc_reset)s %(name)s - %(message)s %(extra)s"
+            "%(asctime)s - %(esc_levelcolor)s%(levelname)-4s%(esc_reset)s %(name)s - %(message)s %(esc_gray)s%(extra)s"
         )
         handler.setFormatter(colored_formatter)
     else:
@@ -196,6 +215,25 @@ def setup_logging(log_level: str, production: bool = True) -> None:
 
     root = logging.getLogger()
     root.addHandler(handler)
-    root.setLevel(logging.WARN)
+    root.setLevel(log_level)
 
-    logger.setLevel(log_level)
+    _silence_noisy_loggers()
+
+    from ..log import logger
+
+    if logger.level == logging.NOTSET:
+        logger.setLevel(log_level)
+
+    from ..pipeline.log import logger
+
+    if logger.level == logging.NOTSET:
+        logger.setLevel(log_level)
+
+    def _configure_plugin_logger(plugin: Plugin) -> None:
+        if plugin.logger is not None and plugin.logger.level == logging.NOTSET:
+            plugin.logger.setLevel(log_level)
+
+    for plugin in Plugin.registered_plugins:
+        _configure_plugin_logger(plugin)
+
+    Plugin.emitter.on("plugin_registered", _configure_plugin_logger)
